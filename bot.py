@@ -1,4 +1,5 @@
 import os
+import wave
 import asyncio
 import tempfile
 import logging
@@ -101,47 +102,45 @@ def build_main_filter(in_rate: int, s: BaitSettings) -> str:
     return ",".join(filters)
 
 
+async def decode_to_wav(src: str, dst: str, af: str | None = None):
+    args = ["-i", src]
+    if af:
+        args += ["-af", af]
+    args += ["-ar", str(OUT_RATE), "-ac", "2", "-c:a", "pcm_s16le", dst]
+    await run_ffmpeg(args)
+
+
+def join_wavs(paths: list[str], out_path: str):
+    with wave.open(out_path, "wb") as out:
+        out.setnchannels(2)
+        out.setsampwidth(2)
+        out.setframerate(OUT_RATE)
+        for p in paths:
+            with wave.open(p, "rb") as w:
+                out.writeframes(w.readframes(w.getnframes()))
+
+
 async def build_bait(input_path: str, output_path: str, settings: BaitSettings):
     """
-    Concatenate intro + processed main track + outro, export as OGG (Vorbis).
-    Intro and outro are untouched by effects; only the main track is processed.
+    Decode intro, processed main, and outro to WAV, join them in Python,
+    then encode once to OGG (Vorbis). No concat filter or demuxer involved.
     """
     in_rate = await probe_sample_rate(input_path)
 
     with tempfile.TemporaryDirectory() as tmp:
-        norm_intro = os.path.join(tmp, "intro.ogg")
-        norm_main = os.path.join(tmp, "main.ogg")
-        norm_outro = os.path.join(tmp, "outro.ogg")
-        concat_list = os.path.join(tmp, "list.txt")
+        intro_wav = os.path.join(tmp, "intro.wav")
+        main_wav = os.path.join(tmp, "main.wav")
+        outro_wav = os.path.join(tmp, "outro.wav")
+        joined_wav = os.path.join(tmp, "joined.wav")
+
+        await decode_to_wav(INTRO_PATH, intro_wav)
+        await decode_to_wav(input_path, main_wav, build_main_filter(in_rate, settings))
+        await decode_to_wav(OUTRO_PATH, outro_wav)
+
+        join_wavs([intro_wav, main_wav, outro_wav], joined_wav)
 
         await run_ffmpeg([
-            "-i", INTRO_PATH,
-            "-ar", str(OUT_RATE), "-ac", "2",
-            "-c:a", "libvorbis", "-q:a", "6",
-            norm_intro,
-        ])
-
-        await run_ffmpeg([
-            "-i", input_path,
-            "-af", build_main_filter(in_rate, settings),
-            "-ac", "2",
-            "-c:a", "libvorbis", "-q:a", "6",
-            norm_main,
-        ])
-
-        await run_ffmpeg([
-            "-i", OUTRO_PATH,
-            "-ar", str(OUT_RATE), "-ac", "2",
-            "-c:a", "libvorbis", "-q:a", "6",
-            norm_outro,
-        ])
-
-        with open(concat_list, "w") as f:
-            for p in (norm_intro, norm_main, norm_outro):
-                f.write(f"file '{p}'\n")
-
-        await run_ffmpeg([
-            "-f", "concat", "-safe", "0", "-i", concat_list,
+            "-i", joined_wav,
             "-c:a", "libvorbis", "-q:a", "6",
             output_path,
         ])
