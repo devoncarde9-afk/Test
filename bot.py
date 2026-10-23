@@ -34,14 +34,20 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
 
+def anywhere(fn):
+    """Allow a command to run in servers, DMs, and group DMs when user-installed."""
+    fn = app_commands.allowed_installs(guilds=True, users=True)(fn)
+    return app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)(fn)
+
+
 @dataclass(frozen=True)
 class BaitSettings:
-    speed: float = 1.0      # tempo + pitch together (turntable style)
-    pitch: float = 0.0      # semitones, tempo preserved
-    tempo: float = 1.0      # tempo multiplier, pitch preserved
-    reverb: str = "off"     # key of REVERB_PRESETS, or "off"
-    volume: float = 1.0     # multiplier on the main track, limited
-    gain_db: float = 0.0    # raw dB boost on the main track, allowed to clip
+    speed: float = 1.0        # tempo + pitch together (turntable style)
+    pitch: float = 0.0        # semitones, tempo preserved
+    tempo: float = 1.0        # tempo multiplier, pitch preserved
+    reverb: str = "off"       # key of REVERB_PRESETS, or "off"
+    volume: float = 1.0       # multiplier on the main track, limited
+    gain_db: float = 0.0      # raw dB boost on the main track, allowed to clip
     bass_cut_db: float = 0.0  # dB cut around BASS_CUT_FREQ, 0 = keep bass
 
 
@@ -223,6 +229,7 @@ async def process_and_reply(
     app_commands.Choice(name="1.4x", value="1.4"),
     app_commands.Choice(name="1.7x", value="1.7"),
 ])
+@anywhere
 async def bait(
     interaction: discord.Interaction,
     file: discord.Attachment,
@@ -237,6 +244,7 @@ async def bait(
     file="The audio file to process",
     semitones="Pitch shift in semitones (-12 to 12)",
 )
+@anywhere
 async def pitch(
     interaction: discord.Interaction,
     file: discord.Attachment,
@@ -251,6 +259,7 @@ async def pitch(
     file="The audio file to process",
     factor="Tempo multiplier (0.5 to 2.0)",
 )
+@anywhere
 async def tempo(
     interaction: discord.Interaction,
     file: discord.Attachment,
@@ -270,6 +279,7 @@ async def tempo(
     app_commands.Choice(name="hall", value="hall"),
     app_commands.Choice(name="cave", value="cave"),
 ])
+@anywhere
 async def reverb(
     interaction: discord.Interaction,
     file: discord.Attachment,
@@ -284,6 +294,7 @@ async def reverb(
     file="The audio file to process",
     level="Volume multiplier (0.1 to 3.0)",
 )
+@anywhere
 async def volume(
     interaction: discord.Interaction,
     file: discord.Attachment,
@@ -299,6 +310,7 @@ async def volume(
     gain="Boost in dB (0 to 30). Around +20 matches the loud sample.",
     bass="Bass cut in dB (0 keeps bass, 30 removes most of it)",
 )
+@anywhere
 async def loud(
     interaction: discord.Interaction,
     file: discord.Attachment,
