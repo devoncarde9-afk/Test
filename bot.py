@@ -29,6 +29,35 @@ REVERB_PRESETS = {
     "cave": "0.6:0.9:200|300|400:0.5|0.4|0.3",
 }
 
+# Named effects for /fx. Each value is an ffmpeg filter chain applied to the main track.
+FX_PRESETS = {
+    "echo": "aecho=0.8:0.9:500:0.3",
+    "flanger": "flanger",
+    "phaser": "aphaser",
+    "chorus": "chorus=0.7:0.9:55:0.4:0.25:2",
+    "tremolo": "tremolo=f=5:d=0.8",
+    "vibrato": "vibrato=f=6:d=0.5",
+    "telephone": "highpass=f=300,lowpass=f=3400",
+    "radio": "highpass=f=400,lowpass=f=2800,volume=2",
+    "underwater": "lowpass=f=500,aecho=0.6:0.5:300:0.4",
+    "buzz": "tremolo=f=30:d=1",
+    "bass boost": "bass=g=10",
+    "treble boost": "treble=g=8",
+    "bitcrush": "acrusher=bits=6:mode=log:aa=1",
+    "distortion": "acrusher=bits=4:mode=lin:aa=1,volume=2",
+    "wide stereo": "extrastereo=m=2.5",
+    "mono": "pan=stereo|c0=0.5*c0+0.5*c1|c1=0.5*c0+0.5*c1",
+    "swap channels": "pan=stereo|c0=c1|c1=c0",
+    "reverse": "areverse",
+    "vinyl": "lowpass=f=8000,crystalizer=i=3",
+    "crystalize": "crystalizer=i=4",
+    "soft clip": "asoftclip=type=tanh",
+    "compressor": "acompressor=threshold=-20dB:ratio=6:attack=5:release=50:makeup=6",
+    "loudnorm": "loudnorm=I=-14:TP=-1:LRA=11",
+    "gate": "agate=threshold=0.05",
+    "tape": "highpass=f=60,lowpass=f=12000,tremolo=f=0.5:d=0.2,crystalizer=i=2",
+}
+
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
@@ -49,6 +78,7 @@ class BaitSettings:
     volume: float = 1.0       # multiplier on the main track, limited
     gain_db: float = 0.0      # raw dB boost on the main track, allowed to clip
     bass_cut_db: float = 0.0  # dB cut around BASS_CUT_FREQ, 0 = keep bass
+    fx: str = "none"          # key of FX_PRESETS, or "none"
 
 
 async def run_ffmpeg(args: list[str]):
@@ -122,6 +152,9 @@ def build_main_filter(in_rate: int, s: BaitSettings) -> str:
 
     if s.reverb in REVERB_PRESETS:
         filters.append(f"aecho={REVERB_PRESETS[s.reverb]}")
+
+    if s.fx in FX_PRESETS:
+        filters.append(FX_PRESETS[s.fx])
 
     if abs(s.volume - 1.0) > 1e-6:
         filters.append(f"volume={s.volume:.4f}:precision=float")
@@ -324,11 +357,19 @@ async def loud(
     await process_and_reply(interaction, file, settings, label)
 
 
-@bot.event
-async def on_ready():
-    await tree.sync()
-    log.info(f"Logged in as {bot.user}")
-
-
-if __name__ == "__main__":
-    bot.run(TOKEN)
+@tree.command(name="fx", description="Apply a sound effect to the main track")
+@app_commands.describe(
+    file="The audio file to process",
+    effect="Sound effect",
+)
+@app_commands.choices(effect=[
+    app_commands.Choice(name=name, value=name) for name in FX_PRESETS
+])
+@anywhere
+async def fx(
+    interaction: discord.Interaction,
+    file: discord.Attachment,
+    effect: app_commands.Choice[str],
+):
+    settings = BaitSettings(fx=effect.value)
+    await process_and_reply(interaction, file, settings, f"{
