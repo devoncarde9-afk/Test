@@ -20,6 +20,7 @@ OUTRO_PATH = os.path.join(ASSETS_DIR, "outro.mp3")
 MAX_DISCORD_UPLOAD = 25 * 1024 * 1024  # 25 MB, adjust for your server's boost level
 OUT_RATE = 44100
 DEFAULT_IN_RATE = 44100
+BASS_CUT_FREQ = 100  # Hz, center of the bass cut
 
 # aecho: in_gain:out_gain:delays_ms:decays
 REVERB_PRESETS = {
@@ -35,12 +36,13 @@ tree = bot.tree
 
 @dataclass(frozen=True)
 class BaitSettings:
-    speed: float = 1.0    # tempo + pitch together (turntable style)
-    pitch: float = 0.0    # semitones, tempo preserved
-    tempo: float = 1.0    # tempo multiplier, pitch preserved
-    reverb: str = "off"   # key of REVERB_PRESETS, or "off"
-    volume: float = 1.0   # multiplier on the main track, limited
-    gain_db: float = 0.0  # raw dB boost on the main track, allowed to clip
+    speed: float = 1.0      # tempo + pitch together (turntable style)
+    pitch: float = 0.0      # semitones, tempo preserved
+    tempo: float = 1.0      # tempo multiplier, pitch preserved
+    reverb: str = "off"     # key of REVERB_PRESETS, or "off"
+    volume: float = 1.0     # multiplier on the main track, limited
+    gain_db: float = 0.0    # raw dB boost on the main track, allowed to clip
+    bass_cut_db: float = 0.0  # dB cut around BASS_CUT_FREQ, 0 = keep bass
 
 
 async def run_ffmpeg(args: list[str]):
@@ -105,6 +107,12 @@ def build_main_filter(in_rate: int, s: BaitSettings) -> str:
     apparent_rate = round(in_rate * s.speed * pitch_ratio)
     filters = [f"asetrate={apparent_rate}", f"aresample={OUT_RATE}"]
     filters += atempo_chain(s.tempo / pitch_ratio)
+
+    # Bass cut runs before gain so the boost doesn't bring the bass back.
+    if abs(s.bass_cut_db) > 1e-6:
+        filters.append(
+            f"equalizer=f={BASS_CUT_FREQ}:width_type=o:width=1:g={-abs(s.bass_cut_db):.2f}"
+        )
 
     if s.reverb in REVERB_PRESETS:
         filters.append(f"aecho={REVERB_PRESETS[s.reverb]}")
@@ -285,18 +293,23 @@ async def volume(
     await process_and_reply(interaction, file, settings, f"volume {level:g}x")
 
 
-@tree.command(name="loud", description="Boost the main track in dB, clipping allowed (loud/distorted)")
+@tree.command(name="loud", description="Boost the main track in dB, clipping allowed, with optional bass cut")
 @app_commands.describe(
     file="The audio file to process",
     gain="Boost in dB (0 to 30). Around +20 matches the loud sample.",
+    bass="Bass cut in dB (0 keeps bass, 30 removes most of it)",
 )
 async def loud(
     interaction: discord.Interaction,
     file: discord.Attachment,
     gain: app_commands.Range[float, 0.0, 30.0],
+    bass: app_commands.Range[float, 0.0, 30.0] = 0.0,
 ):
-    settings = BaitSettings(gain_db=gain)
-    await process_and_reply(interaction, file, settings, f"+{gain:g} dB boost")
+    settings = BaitSettings(gain_db=gain, bass_cut_db=bass)
+    label = f"+{gain:g} dB boost"
+    if bass > 0:
+        label += f", bass cut -{bass:g} dB"
+    await process_and_reply(interaction, file, settings, label)
 
 
 @bot.event
