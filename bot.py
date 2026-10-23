@@ -39,7 +39,8 @@ class BaitSettings:
     pitch: float = 0.0    # semitones, tempo preserved
     tempo: float = 1.0    # tempo multiplier, pitch preserved
     reverb: str = "off"   # key of REVERB_PRESETS, or "off"
-    volume: float = 1.0   # multiplier on the main track
+    volume: float = 1.0   # multiplier on the main track, limited
+    gain_db: float = 0.0  # raw dB boost on the main track, allowed to clip
 
 
 async def run_ffmpeg(args: list[str]):
@@ -112,6 +113,11 @@ def build_main_filter(in_rate: int, s: BaitSettings) -> str:
         filters.append(f"volume={s.volume:.4f}:precision=float")
         if s.volume > 1.0:
             filters.append("alimiter=limit=0.95")
+
+    # Raw gain with no limiter. Samples past full scale clip at WAV encode.
+    if abs(s.gain_db) > 1e-6:
+        linear = 10 ** (s.gain_db / 20)
+        filters.append(f"volume={linear:.6f}:precision=float")
 
     return ",".join(filters)
 
@@ -265,7 +271,7 @@ async def reverb(
     await process_and_reply(interaction, file, settings, f"{preset.name} reverb")
 
 
-@tree.command(name="volume", description="Change volume of the main track")
+@tree.command(name="volume", description="Change volume of the main track (limited, no clipping)")
 @app_commands.describe(
     file="The audio file to process",
     level="Volume multiplier (0.1 to 3.0)",
@@ -277,6 +283,20 @@ async def volume(
 ):
     settings = BaitSettings(volume=level)
     await process_and_reply(interaction, file, settings, f"volume {level:g}x")
+
+
+@tree.command(name="loud", description="Boost the main track in dB, clipping allowed (loud/distorted)")
+@app_commands.describe(
+    file="The audio file to process",
+    gain="Boost in dB (0 to 30). Around +20 matches the loud sample.",
+)
+async def loud(
+    interaction: discord.Interaction,
+    file: discord.Attachment,
+    gain: app_commands.Range[float, 0.0, 30.0],
+):
+    settings = BaitSettings(gain_db=gain)
+    await process_and_reply(interaction, file, settings, f"+{gain:g} dB boost")
 
 
 @bot.event
