@@ -68,6 +68,20 @@ async def probe_sample_rate(path: str) -> int:
         return DEFAULT_IN_RATE
 
 
+async def probe_duration(path: str) -> float:
+    proc = await asyncio.create_subprocess_exec(
+        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+        "-of", "default=nw=1:nk=1", path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await proc.communicate()
+    try:
+        return float(stdout.decode().strip())
+    except ValueError:
+        return 0.0
+
+
 def atempo_chain(factor: float) -> list[str]:
     """atempo only accepts 0.5–2.0 per instance, so split larger/smaller factors."""
     filters = []
@@ -179,8 +193,9 @@ async def process_and_reply(
             )
             return
 
+        out_len = await probe_duration(output_path)
         await interaction.followup.send(
-            content=f"Done — {label}.",
+            content=f"Done — {label}. Output length: {out_len:.1f}s.",
             file=discord.File(output_path, filename="bait.ogg"),
         )
 
