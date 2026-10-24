@@ -1,9 +1,9 @@
-# fly.toml app configuration file generated for test-pmop7a on 2026-10-23T23:00:37Z
+# fly.toml app configuration file generated for test-oyaamw on 2026-10-24T03:39:53Z
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = 'test-pmop7a'
+app = 'test-oyaamw'
 primary_region = 'ams'
 
 [build]
