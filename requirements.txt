@@ -2,3 +2,5 @@ discord.py>=2.4.0
 psutil
 Pillow
 yt-dlp
+flask
+requests
