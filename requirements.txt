@@ -5,3 +5,4 @@ yt-dlp
 flask
 requests
 yt-dlp
+yt-dlp[default]==2026.10.26
