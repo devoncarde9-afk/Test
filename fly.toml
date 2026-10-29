@@ -1,0 +1,9 @@
+
+
+app = "test-pmop7a"
+primary_region = "yyz"
+
+[build]
+
+[processes]
+  app = "python bot.py"
