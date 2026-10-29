@@ -41,7 +41,7 @@ from audiobot.audio import (
     process_thirty_two_tracks,
     process_volume,
 )
-from audiobot.bypass import INTRO_PATH, OUTRO_PATH, process_bypass
+from audiobot.bypass import process_bypass
 from audiobot.downloader import AudioDownloader, DownloadFailed
 from audiobot.formatting import (
     format_duration,
@@ -66,7 +66,6 @@ MIX_FAILURE_TEXT = "<:6426error:1564288600135442484> ไม่สามารถ
 BOT_COLOR = 0x1DB954
 DEFAULT_UPLOAD_LIMIT = 10 * 1024 * 1024
 MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024
-MAX_MIX_DURATION_SECONDS = 7 * 60
 MB = 1024 * 1024
 
 
@@ -114,33 +113,6 @@ def _format_dbfs(value: float) -> str:
     if math.isinf(value) and value < 0:
         return "-inf"
     return f"{value:.1f}"
-
-
-def _limit_mix_duration(output_path: Path) -> None:
-    """Trim a mixed audio result to at most seven minutes."""
-    trimmed_path = output_path.with_name(f"{output_path.stem}_trimmed{output_path.suffix}")
-    try:
-        result = subprocess.run(
-            [
-                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-                "-i", str(output_path), "-t", str(MAX_MIX_DURATION_SECONDS),
-                "-vn", "-c:a", "libopus", "-b:a", "128k", str(trimmed_path),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=180,
-            check=False,
-        )
-        if result.returncode != 0 or not trimmed_path.exists() or trimmed_path.stat().st_size == 0:
-            raise AudioProcessingError(
-                f"Could not trim mix to seven minutes: {result.stderr[-1000:]}"
-            )
-        trimmed_path.replace(output_path)
-    finally:
-        try:
-            trimmed_path.unlink(missing_ok=True)
-        except OSError:
-            pass
 
 
 class MixOrderView(discord.ui.View):
@@ -231,10 +203,6 @@ class MixOrderView(discord.ui.View):
                     second_path,
                     output_path,
                 ),
-            )
-            await loop.run_in_executor(
-                self.executor,
-                functools.partial(_limit_mix_duration, output_path),
             )
 
             if output_path.stat().st_size > _upload_limit(self.ctx):
@@ -655,6 +623,89 @@ class DownloadCog(commands.Cog):
             process_stack,
         )
 
+    @commands.command(name="nbashiesty")
+    @commands.cooldown(1, 10, commands.BucketType.user)
+    async def nbashiesty(self, ctx: commands.Context) -> None:
+        """Apply the nbashiesty preset to an attached audio file."""
+        attachment = await resolve_audio_attachment(ctx)
+        if attachment is None or attachment.size > MAX_ATTACHMENT_BYTES:
+            await ctx.reply(EIGHT_FAILURE_TEXT, mention_author=False)
+            return
+
+        tmpdir = Path(tempfile.mkdtemp(prefix="audiobot_nbashiesty_"))
+        status = await ctx.reply(EIGHT_LOADING_TEXT, mention_author=False)
+        loop = asyncio.get_running_loop()
+
+        try:
+            suffix = Path(attachment.filename).suffix.lower() or ".audio"
+            source_path = tmpdir / f"input{suffix}"
+            speed_path = tmpdir / "speed.ogg"
+            tempo_path = tmpdir / "tempo.ogg"
+            pitch_path = tmpdir / "pitch.ogg"
+            output_path = tmpdir / unique_ogg_filename()
+            await attachment.save(str(source_path))
+
+            # 1. Speed 1.050x; 2. tempo +5% (1.050x); 3. pitch down 4.650 semitones.
+            await loop.run_in_executor(
+                self.executor,
+                functools.partial(process_speed, source_path, speed_path, 1.050),
+            )
+            await loop.run_in_executor(
+                self.executor,
+                functools.partial(process_tempo, speed_path, tempo_path, 1.050),
+            )
+            pitch_factor = parse_pitch("-4.650")
+            await loop.run_in_executor(
+                self.executor,
+                functools.partial(process_pitch, tempo_path, pitch_path, pitch_factor),
+            )
+
+            # Split stereo into left/right tracks. Apply tremolo only to the right
+            # (bottom) track, recombine, then invert polarity on both channels.
+            filter_graph = (
+                "[0:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+                "asplit=2[base][trem];"
+                "[base]pan=mono|c0=c0[left];"
+                "[trem]pan=mono|c0=c1,tremolo=f=5:d=0.5[right];"
+                "[left][right]join=inputs=2:channel_layout=stereo[stereo];"
+                "[stereo]aeval=exprs='-val(0)|-val(1)':c=stereo[out]"
+            )
+            def render() -> None:
+                result = subprocess.run(
+                    [
+                        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                        "-i", str(pitch_path), "-filter_complex", filter_graph,
+                        "-map", "[out]", "-c:a", "libopus", "-b:a", "192k",
+                        str(output_path),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if result.returncode != 0 or not output_path.exists() or output_path.stat().st_size == 0:
+                    detail = result.stderr.strip()[-1200:]
+                    raise AudioProcessingError(f"nbashiesty render failed: {detail}")
+
+            await loop.run_in_executor(self.executor, render)
+
+            if output_path.stat().st_size > _upload_limit(ctx):
+                await _safe_edit(status, EIGHT_FAILURE_TEXT)
+                return
+
+            file = discord.File(str(output_path), filename=output_path.name)
+            await status.edit(content=EIGHT_SUCCESS_TEXT, attachments=[file])
+        except AudioProcessingError as exc:
+            log.warning("nbashiesty processing failed: %s", exc)
+            await _safe_edit(status, EIGHT_FAILURE_TEXT)
+        except discord.HTTPException as exc:
+            log.warning("nbashiesty upload failed: %s", exc)
+            await _safe_edit(status, EIGHT_FAILURE_TEXT)
+        except Exception:
+            log.exception("Error in nbashiesty command")
+            await _safe_edit(status, EIGHT_FAILURE_TEXT)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
     @commands.command(name="bypass")
     @commands.cooldown(1, 10, commands.BucketType.user)
     async def bypass(self, ctx: commands.Context) -> None:
@@ -672,42 +723,9 @@ class DownloadCog(commands.Cog):
             source_path = tmpdir / f"input{suffix}"
             await attachment.save(str(source_path))
 
-            # Resolve the bypass sound assets defensively. Some deployments have
-            # non-ASCII asset filenames that may not match the configured outro path.
-            intro_path = INTRO_PATH
-            outro_path = OUTRO_PATH
-            asset_dir = INTRO_PATH.parent
-            if not intro_path.is_file():
-                candidates = sorted(asset_dir.glob("*.ogg"))
-                intro_path = next(
-                    (path for path in candidates if "russia" in path.name.casefold()),
-                    candidates[0] if candidates else intro_path,
-                )
-            if not outro_path.is_file():
-                candidates = sorted(
-                    path for path in asset_dir.glob("*.ogg")
-                    if path.resolve() != intro_path.resolve()
-                )
-                if candidates:
-                    outro_path = next(
-                        (path for path in candidates if "หลัง" in path.name),
-                        candidates[0],
-                    )
-
-            if not intro_path.is_file() or not outro_path.is_file():
-                raise AudioProcessingError(
-                    f"Bypass sound assets missing; intro={intro_path}, outro={outro_path}"
-                )
-
             output_path = await loop.run_in_executor(
                 self.executor,
-                functools.partial(
-                    process_bypass,
-                    source_path,
-                    tmpdir,
-                    intro_path=intro_path,
-                    outro_path=outro_path,
-                ),
+                functools.partial(process_bypass, source_path, tmpdir),
             )
 
             if output_path.stat().st_size > _upload_limit(ctx):
@@ -718,10 +736,10 @@ class DownloadCog(commands.Cog):
             await status.edit(content=EIGHT_SUCCESS_TEXT, attachments=[file])
 
         except AudioProcessingError as exc:
-            log.exception("ประมวลผลเสียงในคำสั่ง bypass ไม่สำเร็จ: %s", exc)
+            log.warning("ประมวลผลเสียงไม่สำเร็จ: %s", exc)
             await _safe_edit(status, EIGHT_FAILURE_TEXT)
         except discord.HTTPException as exc:
-            log.warning("อัปโหลดผลลัพธ์ bypass ไม่สำเร็จ: %s", exc)
+            log.warning("อัปโหลดไม่สำเร็จ: %s", exc)
             await _safe_edit(status, EIGHT_FAILURE_TEXT)
         except Exception:
             log.exception("เกิดข้อผิดพลาดในคำสั่ง bypass")
@@ -996,6 +1014,11 @@ class DownloadCog(commands.Cog):
         embed.add_field(
             name=">probe",
             value="เช็คความดัง",
+            inline=False,
+        )
+        embed.add_field(
+            name=">nbashiesty",
+            value="Apply speed 1.050x, tempo +5%, pitch -4.650 semitones, right-channel tremolo, and polarity inversion.",
             inline=False,
         )
         embed.add_field(
