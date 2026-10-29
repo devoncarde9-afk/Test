@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import logging
@@ -9,8 +10,10 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-DEFAULT_ALLOWED_CHANNEL_ID = 1564276697551872030
-DEFAULT_REQUIRED_ROLE_ID = 1526986518995144705
+
+# Your Discord channel and role IDs
+DEFAULT_ALLOWED_CHANNEL_ID = 1562831868674441288
+DEFAULT_REQUIRED_ROLE_ID = 1565201474869403658
 
 log = logging.getLogger(__name__)
 
@@ -62,8 +65,14 @@ def load_settings() -> Settings:
     load_dotenv(BASE_DIR / ".env")
     return Settings(
         token=os.getenv("DISCORD_TOKEN", "").strip(),
-        allowed_channel_id=_env_id("ALLOWED_CHANNEL_ID", DEFAULT_ALLOWED_CHANNEL_ID),
-        required_role_id=_env_id("REQUIRED_ROLE_ID", DEFAULT_REQUIRED_ROLE_ID),
+        allowed_channel_id=_env_id(
+            "ALLOWED_CHANNEL_ID",
+            DEFAULT_ALLOWED_CHANNEL_ID,
+        ),
+        required_role_id=_env_id(
+            "REQUIRED_ROLE_ID",
+            DEFAULT_REQUIRED_ROLE_ID,
+        ),
         cookies_file=find_cookies_file(),
         js_runtimes=detect_js_runtimes(),
     )
