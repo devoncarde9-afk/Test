@@ -1,0 +1,1335 @@
+from __future__ import annotations
+
+import asyncio
+import functools
+import logging
+import math
+import shutil
+import subprocess
+import tempfile
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import discord
+from discord.ext import commands
+
+from audiobot.attachments import resolve_audio_attachment, resolve_audio_attachments
+from audiobot.audio import (
+    MAX_HIGHPASS_HZ,
+    MAX_SHELF_GAIN_DB,
+    MIN_HIGHPASS_HZ,
+    MIN_SHELF_GAIN_DB,
+    AudioProcessingError,
+    parse_pitch,
+    parse_speed,
+    parse_stack_count,
+    parse_tempo,
+    parse_time_value,
+    parse_volume_db,
+    process_aeksets,
+    process_aekloudlowhz,
+    process_cut,
+    process_eight_mono,
+    process_fcut,
+    process_mix,
+    process_probe,
+    process_pitch,
+    process_speed,
+    process_stack,
+    process_tempo,
+    process_thirty_two_tracks,
+    process_volume,
+)
+from audiobot.bypass import process_bypass
+from audiobot.downloader import AudioDownloader, DownloadFailed
+from audiobot.formatting import (
+    format_duration,
+    normalize_url,
+    safe_filename,
+    unique_ogg_filename,
+)
+
+log = logging.getLogger(__name__)
+
+LOADING_TEXT = "<a:483862loading:1564284084019003543> Downloading audio..."
+SUCCESS_TEXT = "<a:752793check:1564288273948483676> Audio download complete!"
+FAILURE_TEXT = "<:6426error:1564288600135442484> Unable to download audio right now."
+EIGHT_LOADING_TEXT = "<a:483862loading:1564284084019003543> Processing audio..."
+EIGHT_SUCCESS_TEXT = "<a:752793check:1564288273948483676> Audio processing complete!"
+EIGHT_FAILURE_TEXT = "<:6426error:1564288600135442484> Unable to process audio right now."
+MIX_PROMPT_TEXT = "<a:2923printsdark:1564608850798190752> Which audio order would you like?"
+MIX_TIMEOUT_TEXT = "<:6426error:1564288600135442484> Selection timed out."
+MIX_LOADING_TEXT = "<a:483862loading:1564284084019003543> Processing audio..."
+MIX_SUCCESS_TEXT = "<a:752793check:1564288273948483676> Audio processing complete!"
+MIX_FAILURE_TEXT = "<:6426error:1564288600135442484> Unable to process audio right now."
+BOT_COLOR = 0x1DB954
+DEFAULT_UPLOAD_LIMIT = 10 * 1024 * 1024
+MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024
+MB = 1024 * 1024
+
+
+async def _safe_edit(message: discord.Message, content: str) -> None:
+    try:
+        await message.edit(content=content)
+    except discord.HTTPException:
+        pass
+
+
+def _upload_limit(ctx: commands.Context) -> int:
+    limit = getattr(ctx.guild, "filesize_limit", None) if ctx.guild else None
+    if not limit:
+        limit = DEFAULT_UPLOAD_LIMIT
+    return max(int(limit * 0.98), 1 * MB)
+
+
+def _parse_processing_args(
+    highpass: str | None,
+    bass: str | None,
+    treble: str | None,
+) -> tuple[int | None, float, float]:
+    highpass_hz: int | None = None
+    if highpass is not None and highpass.casefold() not in {"0", "off", "none", "-"}:
+        highpass_hz = int(highpass)
+        if not MIN_HIGHPASS_HZ <= highpass_hz <= MAX_HIGHPASS_HZ:
+            raise ValueError
+
+    bass_db = 0.0 if bass is None else float(bass)
+    treble_db = 0.0 if treble is None else float(treble)
+    if not MIN_SHELF_GAIN_DB <= bass_db <= MAX_SHELF_GAIN_DB:
+        raise ValueError
+    if not MIN_SHELF_GAIN_DB <= treble_db <= MAX_SHELF_GAIN_DB:
+        raise ValueError
+
+    return highpass_hz, bass_db, treble_db
+
+
+def _mix_label(filename: str) -> str:
+    name = Path(filename).stem.strip() or Path(filename).name.strip()
+    return (name or "?")[:35]
+
+
+def _format_dbfs(value: float) -> str:
+    if math.isinf(value) and value < 0:
+        return "-inf"
+    return f"{value:.1f}"
+
+
+class MixOrderView(discord.ui.View):
+    def __init__(
+        self,
+        ctx: commands.Context,
+        attachments: list[discord.Attachment],
+        executor: ThreadPoolExecutor,
+    ) -> None:
+        super().__init__(timeout=120)
+        self.ctx = ctx
+        self.attachments = attachments
+        self.executor = executor
+        self.message: discord.Message | None = None
+
+        first = _mix_label(attachments[0].filename)
+        second = _mix_label(attachments[1].filename)
+        self._add_order_button(
+            first,
+            second,
+            0,
+            discord.ButtonStyle.primary,
+        )
+        self._add_order_button(
+            second,
+            first,
+            1,
+            discord.ButtonStyle.success,
+        )
+
+    def _add_order_button(
+        self,
+        front: str,
+        back: str,
+        order: int,
+        style: discord.ButtonStyle,
+    ) -> None:
+        button = discord.ui.Button(
+            label=f"{front} | {back}"[:80],
+            style=style,
+        )
+        button.callback = functools.partial(self._choose, order=order)
+        self.add_item(button)
+
+    async def _choose(
+        self,
+        interaction: discord.Interaction,
+        order: int,
+    ) -> None:
+        if interaction.user.id != self.ctx.author.id:
+            await interaction.response.send_message(
+                "<:6426error:1564288600135442484> These controls are not for you.",
+                ephemeral=True,
+            )
+            return
+
+        self.stop()
+        try:
+            await interaction.response.edit_message(
+                content=MIX_LOADING_TEXT,
+                view=None,
+            )
+        except discord.HTTPException:
+            return
+
+        if order == 0:
+            first, second = self.attachments
+        else:
+            first, second = self.attachments[1], self.attachments[0]
+
+        tmpdir = Path(tempfile.mkdtemp(prefix="audiobot_mix_"))
+        loop = asyncio.get_running_loop()
+
+        try:
+            first_path = tmpdir / f"first{Path(first.filename).suffix.lower()}"
+            second_path = tmpdir / f"second{Path(second.filename).suffix.lower()}"
+            await first.save(str(first_path))
+            await second.save(str(second_path))
+
+            output_name = unique_ogg_filename()
+            output_path = tmpdir / output_name
+
+            await loop.run_in_executor(
+                self.executor,
+                functools.partial(
+                    process_mix,
+                    first_path,
+                    second_path,
+                    output_path,
+                ),
+            )
+
+            if output_path.stat().st_size > _upload_limit(self.ctx):
+                await self._edit(MIX_FAILURE_TEXT)
+                return
+
+            file = discord.File(str(output_path), filename=output_name)
+            await self._edit(MIX_SUCCESS_TEXT, attachments=[file])
+
+        except AudioProcessingError as exc:
+            log.exception("Failed to combine audio files: %s", exc)
+            await self._edit(MIX_FAILURE_TEXT)
+        except discord.HTTPException as exc:
+            log.warning("Upload failed: %s", exc)
+        except Exception:
+            log.exception("An error occurred in the mix command")
+            await self._edit(MIX_FAILURE_TEXT)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    async def _edit(
+        self,
+        content: str,
+        attachments: list[discord.File] | None = None,
+    ) -> None:
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(
+                content=content,
+                attachments=attachments or [],
+                view=None,
+            )
+        except discord.HTTPException:
+            pass
+
+    async def on_timeout(self) -> None:
+        await self._edit(MIX_TIMEOUT_TEXT)
+
+
+class DownloadCog(commands.Cog):
+    def __init__(
+        self,
+        bot: commands.Bot,
+        downloader: AudioDownloader,
+        executor: ThreadPoolExecutor,
+    ) -> None:
+        self.bot = bot
+        self.downloader = downloader
+        self.executor = executor
+        self._slash_commands_synced = False
+
+    @commands.Cog.listener()
+    async def on_ready(self) -> None:
+        # Hybrid commands must be synced before they appear in Discord's / menu.
+        # Do this once after all cogs have loaded.
+        if not self._slash_commands_synced:
+            try:
+                synced = await self.bot.tree.sync()
+                log.info("Synced %s global slash commands", len(synced))
+                self._slash_commands_synced = True
+            except Exception:
+                log.exception("Failed to sync global slash commands")
+
+    async def _apply_effect(
+        self,
+        ctx: commands.Context,
+        name: str,
+        value: str | None,
+        parser: Callable[[str], float],
+        processor: Callable[[Path, Path, float], None],
+        attachment: discord.Attachment | None = None,
+    ) -> None:
+        attachment = attachment or await resolve_audio_attachment(ctx)
+        if (
+            not value
+            or attachment is None
+            or attachment.size > MAX_ATTACHMENT_BYTES
+        ):
+            await ctx.reply(EIGHT_FAILURE_TEXT, mention_author=False)
+            return
+
+        try:
+            factor = parser(value)
+        except ValueError:
+            await ctx.reply(EIGHT_FAILURE_TEXT, mention_author=False)
+            return
+
+        tmpdir = Path(tempfile.mkdtemp(prefix=f"audiobot_{name}_"))
+        status = await ctx.reply(EIGHT_LOADING_TEXT, mention_author=False)
+        loop = asyncio.get_running_loop()
+
+        try:
+            suffix = Path(attachment.filename).suffix.lower()
+            source_path = tmpdir / f"input{suffix}"
+            await attachment.save(str(source_path))
+
+            output_name = unique_ogg_filename()
+            output_path = tmpdir / output_name
+
+            await loop.run_in_executor(
+                self.executor,
+                functools.partial(
+                    processor,
+                    source_path,
+                    output_path,
+                    factor,
+                ),
+            )
+
+            if output_path.stat().st_size > _upload_limit(ctx):
+                await _safe_edit(status, EIGHT_FAILURE_TEXT)
+                return
+
+            file = discord.File(str(output_path), filename=output_name)
+            await status.edit(content=EIGHT_SUCCESS_TEXT, attachments=[file])
+
+        except AudioProcessingError as exc:
+            log.warning("Audio processing failed (%s): %s", name, exc)
+            await _safe_edit(status, EIGHT_FAILURE_TEXT)
+        except discord.HTTPException as exc:
+            log.warning("Upload failed: %s", exc)
+            await _safe_edit(status, EIGHT_FAILURE_TEXT)
+        except Exception:
+            log.exception("An error occurred in command %s", name)
+            await _safe_edit(status, EIGHT_FAILURE_TEXT)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    async def _apply_tone_effect(
+        self,
+        ctx: commands.Context,
+        name: str,
+        value: str | None,
+        highpass: str | None,
+        bass: str | None,
+        treble: str | None,
+        parser: Callable[[str], float | int],
+        processor: Callable[..., None],
+        attachment: discord.Attachment | None = None,
+    ) -> None:
+        attachment = attachment or await resolve_audio_attachment(ctx)
+        if (
+            value is None
+            or attachment is None
+            or attachment.size > MAX_ATTACHMENT_BYTES
+        ):
+            await ctx.reply(EIGHT_FAILURE_TEXT, mention_author=False)
+            return
+
+        try:
+            amount = parser(value)
+            highpass_hz, bass_db, treble_db = _parse_processing_args(
+                highpass,
+                bass,
+                treble,
+            )
+        except ValueError:
+            await ctx.reply(EIGHT_FAILURE_TEXT, mention_author=False)
+            return
+
+        tmpdir = Path(tempfile.mkdtemp(prefix=f"audiobot_{name}_"))
+        status = await ctx.reply(EIGHT_LOADING_TEXT, mention_author=False)
+        loop = asyncio.get_running_loop()
+
+        try:
+            suffix = Path(attachment.filename).suffix.lower()
+            source_path = tmpdir / f"input{suffix}"
+            await attachment.save(str(source_path))
+
+            output_name = unique_ogg_filename()
+            output_path = tmpdir / output_name
+
+            await loop.run_in_executor(
+                self.executor,
+                functools.partial(
+                    processor,
+                    source_path,
+                    output_path,
+                    amount,
+                    highpass_hz,
+                    bass_db,
+                    treble_db,
+                ),
+            )
+
+            if output_path.stat().st_size > _upload_limit(ctx):
+                await _safe_edit(status, EIGHT_FAILURE_TEXT)
+                return
+
+            file = discord.File(str(output_path), filename=output_name)
+            await status.edit(content=EIGHT_SUCCESS_TEXT, attachments=[file])
+
+        except AudioProcessingError as exc:
+            log.warning("Audio processing failed (%s): %s", name, exc)
+            await _safe_edit(status, EIGHT_FAILURE_TEXT)
+        except discord.HTTPException as exc:
+            log.warning("Upload failed: %s", exc)
+            await _safe_edit(status, EIGHT_FAILURE_TEXT)
+        except Exception:
+            log.exception("An error occurred in command %s", name)
+            await _safe_edit(status, EIGHT_FAILURE_TEXT)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    @commands.hybrid_command(name="dl")
+    @commands.cooldown(1, 5, commands.BucketType.user)
+    async def dl(self, ctx: commands.Context, link: str | None = None) -> None:
+        if not link:
+            await ctx.reply(FAILURE_TEXT, mention_author=False)
+            return
+
+        url = normalize_url(link)
+        if url is None:
+            await ctx.reply(FAILURE_TEXT, mention_author=False)
+            return
+
+        tmpdir = Path(tempfile.mkdtemp(prefix="audiobot_"))
+        status = await ctx.reply(LOADING_TEXT, mention_author=False)
+        loop = asyncio.get_running_loop()
+
+        try:
+            result = await loop.run_in_executor(
+                self.executor,
+                functools.partial(self.downloader.download, url, tmpdir),
+            )
+
+            audio_path = result.path
+            limit = _upload_limit(ctx)
+
+            if audio_path.stat().st_size > limit:
+                shrunk = await loop.run_in_executor(
+                    self.executor,
+                    functools.partial(self.downloader.shrink, audio_path, limit),
+                )
+                if shrunk is None:
+                    await _safe_edit(status, FAILURE_TEXT)
+                    return
+                audio_path = shrunk
+
+            filename = safe_filename(result.title)
+            file = discord.File(str(audio_path), filename=filename)
+            await status.edit(content=SUCCESS_TEXT, attachments=[file])
+
+        except DownloadFailed as exc:
+            log.warning("Download failed: %s", exc)
+            await _safe_edit(status, FAILURE_TEXT)
+        except RuntimeError as exc:
+            log.warning("Download failed: %s", exc)
+            await _safe_edit(status, FAILURE_TEXT)
+        except discord.HTTPException as exc:
+            log.warning("Upload failed: %s", exc)
+            await _safe_edit(status, FAILURE_TEXT)
+        except Exception:
+            log.exception("An error occurred in the dl command")
+            await _safe_edit(status, FAILURE_TEXT)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    @commands.hybrid_command(name="8mono")
+    @commands.cooldown(1, 10, commands.BucketType.user)
+    async def eight_mono(
+        self,
+        ctx: commands.Context,
+        highpass: str | None = None,
+        bass: str | None = None,
+        treble: str | None = None,
+        attachment: discord.Attachment | None = None,
+    ) -> None:
+        attachment = attachment or await resolve_audio_attachment(ctx)
+        if attachment is None or attachment.size > MAX_ATTACHMENT_BYTES:
+            await ctx.reply(EIGHT_FAILURE_TEXT, mention_author=False)
+            return
+
+        try:
+            highpass_hz, bass_db, treble_db = _parse_processing_args(
+                highpass,
+                bass,
+                treble,
+            )
+        except ValueError:
+            await ctx.reply(EIGHT_FAILURE_TEXT, mention_author=False)
+            return
+
+        tmpdir = Path(tempfile.mkdtemp(prefix="audiobot_8mono_"))
+        status = await ctx.reply(EIGHT_LOADING_TEXT, mention_author=False)
+        loop = asyncio.get_running_loop()
+
+        try:
+            suffix = Path(attachment.filename).suffix.lower()
+            source_path = tmpdir / f"input{suffix}"
+            await attachment.save(str(source_path))
+
+            output_name = unique_ogg_filename()
+            output_path = tmpdir / output_name
+
+            await loop.run_in_executor(
+                self.executor,
+                functools.partial(
+                    process_eight_mono,
+                    source_path,
+                    output_path,
+                    highpass_hz,
+                    bass_db,
+                    treble_db,
+                ),
+            )
+
+            if output_path.stat().st_size > _upload_limit(ctx):
+                await _safe_edit(status, EIGHT_FAILURE_TEXT)
+                return
+
+            file = discord.File(str(output_path), filename=output_name)
+            await status.edit(content=EIGHT_SUCCESS_TEXT, attachments=[file])
+
+        except AudioProcessingError as exc:
+            log.exception("Audio processing failed in bypass command: %s", exc)
+            await _safe_edit(status, EIGHT_FAILURE_TEXT)
+        except discord.HTTPException as exc:
+            log.warning("Upload failed: %s", exc)
+            await _safe_edit(status, EIGHT_FAILURE_TEXT)
+        except Exception:
+            log.exception("An error occurred in the 8mono command")
+            await _safe_edit(status, EIGHT_FAILURE_TEXT)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    @commands.hybrid_command(name="32tracks")
+    @commands.cooldown(1, 10, commands.BucketType.user)
+    async def thirty_two_tracks(
+        self,
+        ctx: commands.Context,
+        highpass: str | None = None,
+        bass: str | None = None,
+        treble: str | None = None,
+        attachment: discord.Attachment | None = None,
+    ) -> None:
+        attachment = attachment or await resolve_audio_attachment(ctx)
+        if attachment is None or attachment.size > MAX_ATTACHMENT_BYTES:
+            await ctx.reply(EIGHT_FAILURE_TEXT, mention_author=False)
+            return
+
+        try:
+            highpass_hz, bass_db, treble_db = _parse_processing_args(
+                highpass,
+                bass,
+                treble,
+            )
+        except ValueError:
+            await ctx.reply(EIGHT_FAILURE_TEXT, mention_author=False)
+            return
+
+        tmpdir = Path(tempfile.mkdtemp(prefix="audiobot_32tracks_"))
+        status = await ctx.reply(EIGHT_LOADING_TEXT, mention_author=False)
+        loop = asyncio.get_running_loop()
+
+        try:
+            suffix = Path(attachment.filename).suffix.lower()
+            source_path = tmpdir / f"input{suffix}"
+            await attachment.save(str(source_path))
+
+            output_name = unique_ogg_filename()
+            output_path = tmpdir / output_name
+
+            await loop.run_in_executor(
+                self.executor,
+                functools.partial(
+                    process_thirty_two_tracks,
+                    source_path,
+                    output_path,
+                    highpass_hz,
+                    bass_db,
+                    treble_db,
+                ),
+            )
+
+            if output_path.stat().st_size > _upload_limit(ctx):
+                await _safe_edit(status, EIGHT_FAILURE_TEXT)
+                return
+
+            file = discord.File(str(output_path), filename=output_name)
+            await status.edit(content=EIGHT_SUCCESS_TEXT, attachments=[file])
+
+        except AudioProcessingError as exc:
+            log.warning("Audio processing failed: %s", exc)
+            await _safe_edit(status, EIGHT_FAILURE_TEXT)
+        except discord.HTTPException as exc:
+            log.warning("Upload failed: %s", exc)
+            await _safe_edit(status, EIGHT_FAILURE_TEXT)
+        except Exception:
+            log.exception("An error occurred in the 32tracks command")
+            await _safe_edit(status, EIGHT_FAILURE_TEXT)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    @commands.hybrid_command(name="vol")
+    @commands.cooldown(1, 10, commands.BucketType.user)
+    async def vol(
+        self,
+        ctx: commands.Context,
+        value: str | None = None,
+        highpass: str | None = None,
+        bass: str | None = None,
+        treble: str | None = None,
+        attachment: discord.Attachment | None = None,
+    ) -> None:
+        await self._apply_tone_effect(
+            ctx,
+            "vol",
+            value,
+            highpass,
+            bass,
+            treble,
+            parse_volume_db,
+            process_volume,
+            attachment,
+        )
+
+    @commands.hybrid_command(name="stack")
+    @commands.cooldown(1, 10, commands.BucketType.user)
+    async def stack(
+        self,
+        ctx: commands.Context,
+        value: str | None = None,
+        highpass: str | None = None,
+        bass: str | None = None,
+        treble: str | None = None,
+        attachment: discord.Attachment | None = None,
+    ) -> None:
+        await self._apply_tone_effect(
+            ctx,
+            "stack",
+            value,
+            highpass,
+            bass,
+            treble,
+            parse_stack_count,
+            process_stack,
+            attachment,
+        )
+
+    @commands.hybrid_command(name="nbashiesty")
+    @commands.cooldown(1, 10, commands.BucketType.user)
+    async def nbashiesty(
+        self, ctx: commands.Context, attachment: discord.Attachment | None = None
+    ) -> None:
+        """Apply the nbashiesty preset to an attached audio file."""
+        attachment = attachment or await resolve_audio_attachment(ctx)
+        if attachment is None or attachment.size > MAX_ATTACHMENT_BYTES:
+            await ctx.reply(EIGHT_FAILURE_TEXT, mention_author=False)
+            return
+
+        tmpdir = Path(tempfile.mkdtemp(prefix="audiobot_nbashiesty_"))
+        status = await ctx.reply(EIGHT_LOADING_TEXT, mention_author=False)
+        loop = asyncio.get_running_loop()
+
+        try:
+            suffix = Path(attachment.filename).suffix.lower() or ".audio"
+            source_path = tmpdir / f"input{suffix}"
+            speed_path = tmpdir / "speed.ogg"
+            tempo_path = tmpdir / "tempo.ogg"
+            pitch_path = tmpdir / "pitch.ogg"
+            output_path = tmpdir / unique_ogg_filename()
+            await attachment.save(str(source_path))
+
+            # 1. Speed 1.050x; 2. tempo +5% (1.050x); 3. pitch down 4.650 semitones.
+            await loop.run_in_executor(
+                self.executor,
+                functools.partial(process_speed, source_path, speed_path, 1.050),
+            )
+            await loop.run_in_executor(
+                self.executor,
+                functools.partial(process_tempo, speed_path, tempo_path, 1.050),
+            )
+            pitch_factor = parse_pitch("-4.650")
+            await loop.run_in_executor(
+                self.executor,
+                functools.partial(process_pitch, tempo_path, pitch_path, pitch_factor),
+            )
+
+            # Split stereo into left/right tracks. Apply tremolo only to the right
+            # (bottom) track, recombine, then invert polarity on both channels.
+            filter_graph = (
+                "[0:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+                "asplit=2[base][trem];"
+                "[base]pan=mono|c0=c0[left];"
+                "[trem]pan=mono|c0=c1,tremolo=f=5:d=0.5[right];"
+                "[left][right]join=inputs=2:channel_layout=stereo[stereo];"
+                "[stereo]aeval=exprs='-val(0)|-val(1)':c=stereo[out]"
+            )
+            def render() -> None:
+                result = subprocess.run(
+                    [
+                        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                        "-i", str(pitch_path), "-filter_complex", filter_graph,
+                        "-map", "[out]", "-c:a", "libopus", "-b:a", "192k",
+                        str(output_path),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if result.returncode != 0 or not output_path.exists() or output_path.stat().st_size == 0:
+                    detail = result.stderr.strip()[-1200:]
+                    raise AudioProcessingError(f"nbashiesty render failed: {detail}")
+
+            await loop.run_in_executor(self.executor, render)
+
+            if output_path.stat().st_size > _upload_limit(ctx):
+                await _safe_edit(status, EIGHT_FAILURE_TEXT)
+                return
+
+            file = discord.File(str(output_path), filename=output_path.name)
+            await status.edit(content=EIGHT_SUCCESS_TEXT, attachments=[file])
+        except AudioProcessingError as exc:
+            log.warning("nbashiesty processing failed: %s", exc)
+            await _safe_edit(status, EIGHT_FAILURE_TEXT)
+        except discord.HTTPException as exc:
+            log.warning("nbashiesty upload failed: %s", exc)
+            await _safe_edit(status, EIGHT_FAILURE_TEXT)
+        except Exception:
+            log.exception("Error in nbashiesty command")
+            await _safe_edit(status, EIGHT_FAILURE_TEXT)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    @commands.hybrid_command(name="op")
+    @commands.cooldown(1, 10, commands.BucketType.user)
+    async def op(
+        self,
+        ctx: commands.Context,
+        db: float = 0.0,
+        bass: float = 0.0,
+        speed: float = 1.4,
+        intro: discord.Attachment | None = None,
+        song_tag: discord.Attachment | None = None,
+        song: discord.Attachment | None = None,
+    ) -> None:
+        """Join the built-in pre bait, your intro, song tag, processed song, and Epic Adventure outro."""
+        if not all((intro, song_tag, song)):
+            await ctx.reply(
+                "Use `/op` and attach these 3 audio files: **your intro**, "
+                "**song intro/tag**, and **main song**. The bot automatically adds "
+                "`pre.ogg` at the beginning and `Epic Adventure.mp3` at the end.",
+                mention_author=False,
+            )
+            return
+        attachments = [intro, song_tag, song]
+        if any(a.size > MAX_ATTACHMENT_BYTES for a in attachments):
+            await ctx.reply("Each uploaded audio file must be under the bot's attachment size limit.", mention_author=False)
+            return
+        if not (-100.0 <= db <= 100.0 and -100.0 <= bass <= 100.0 and 1.0 <= speed <= 2.0):
+            await ctx.reply("Use volume/bass from -100 to 100 and speed from 1.0 to 2.0.", mention_author=False)
+            return
+
+        project_root = Path(__file__).resolve().parents[2]
+        intro_bait_path = project_root / "assets" / "pre.ogg"
+        end_bait_path = project_root / "assets" / "Epic Adventure.mp3"
+        if not intro_bait_path.is_file() or not end_bait_path.is_file():
+            await ctx.reply(
+                "The built-in OP audio files are missing. Make sure `assets/pre.ogg` "
+                "and `assets/Epic Adventure.mp3` are included in the project.",
+                mention_author=False,
+            )
+            return
+
+        tmpdir = Path(tempfile.mkdtemp(prefix="audiobot_op_"))
+        status = await ctx.reply(EIGHT_LOADING_TEXT, mention_author=False)
+        try:
+            saved_paths = []
+            for index, attachment in enumerate(attachments, start=1):
+                suffix = Path(attachment.filename).suffix.lower() or ".audio"
+                saved_path = tmpdir / f"input_{index}{suffix}"
+                await attachment.save(str(saved_path))
+                saved_paths.append(saved_path)
+            intro_path, tag_path, source_path = saved_paths
+            output_path = tmpdir / "op_output.ogg"
+
+            # Fixed sequence: pre bait -> user intro -> song intro/tag -> processed song -> Epic Adventure outro.
+            # Volume, bass, and speed affect only the main song.
+            track_filters = [
+                "aresample=44100",
+                "aformat=sample_fmts=fltp:channel_layouts=stereo",
+            ]
+            if bass != 0.0:
+                track_filters.append(f"bass=g={bass}:f=90:w=0.5")
+            if db != 0.0:
+                track_filters.append(f"volume={db}dB")
+            if speed != 1.0:
+                track_filters.extend([f"asetrate=round(44100*{speed})", "aresample=44100"])
+            filter_complex = (
+                "[0:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo[bait];"
+                "[1:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo[intro];"
+                "[2:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo[tag];"
+                f"[3:a]{','.join(track_filters)}[track];"
+                "[4:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo[outro];"
+                "[bait][intro][tag][track][outro]concat=n=5:v=0:a=1,"
+                "aresample=48000,aformat=sample_fmts=s16:channel_layouts=stereo[out]"
+            )
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-i", str(intro_bait_path), "-i", str(intro_path), "-i", str(tag_path),
+                "-i", str(source_path), "-i", str(end_bait_path),
+                "-filter_complex", filter_complex, "-map", "[out]",
+                "-c:a", "libopus", "-b:a", "192k", str(output_path),
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+            if proc.returncode != 0 or not output_path.is_file() or output_path.stat().st_size < 1024:
+                detail = stderr.decode(errors="ignore")[-500:] or "FFmpeg produced no usable output."
+                raise RuntimeError(detail)
+            if output_path.stat().st_size > _upload_limit(ctx):
+                await _safe_edit(status, EIGHT_FAILURE_TEXT)
+                return
+            out_file = discord.File(str(output_path), filename="op_output.ogg")
+            await status.edit(
+                content=f"OP audio created: pre bait + your intro + song intro/tag + processed song + Epic Adventure outro · Volume {db:+g} dB · Bass {bass:+g} dB · Speed {speed:g}x",
+                attachments=[out_file],
+            )
+        except discord.HTTPException as exc:
+            log.warning("OP command upload failed: %s", exc)
+            await _safe_edit(status, EIGHT_FAILURE_TEXT)
+        except Exception:
+            log.exception("OP command failed")
+            await _safe_edit(status, EIGHT_FAILURE_TEXT)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    @commands.hybrid_command(name="bypass")
+    @commands.cooldown(1, 10, commands.BucketType.user)
+    async def bypass(self, ctx: commands.Context, attachment: discord.Attachment | None = None) -> None:
+        attachment = attachment or await resolve_audio_attachment(ctx)
+        if attachment is None or attachment.size > MAX_ATTACHMENT_BYTES:
+            await ctx.reply(EIGHT_FAILURE_TEXT, mention_author=False)
+            return
+
+        tmpdir = Path(tempfile.mkdtemp(prefix="audiobot_bypass_"))
+        status = await ctx.reply(EIGHT_LOADING_TEXT, mention_author=False)
+        loop = asyncio.get_running_loop()
+
+        try:
+            suffix = Path(attachment.filename).suffix.lower()
+            source_path = tmpdir / f"input{suffix}"
+            await attachment.save(str(source_path))
+
+            output_path = await loop.run_in_executor(
+                self.executor,
+                functools.partial(process_bypass, source_path, tmpdir),
+            )
+
+            if output_path.stat().st_size > _upload_limit(ctx):
+                await _safe_edit(status, EIGHT_FAILURE_TEXT)
+                return
+
+            file = discord.File(str(output_path), filename=output_path.name)
+            await status.edit(content=EIGHT_SUCCESS_TEXT, attachments=[file])
+
+        except AudioProcessingError as exc:
+            log.warning("Audio processing failed: %s", exc)
+            await _safe_edit(status, EIGHT_FAILURE_TEXT)
+        except discord.HTTPException as exc:
+            log.warning("Upload failed: %s", exc)
+            await _safe_edit(status, EIGHT_FAILURE_TEXT)
+        except Exception:
+            log.exception("An error occurred in the bypass command")
+            await _safe_edit(status, EIGHT_FAILURE_TEXT)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    @commands.hybrid_command(name="aeksets")
+    @commands.cooldown(1, 10, commands.BucketType.user)
+    async def aeksets(self, ctx: commands.Context, attachment: discord.Attachment | None = None) -> None:
+        attachment = attachment or await resolve_audio_attachment(ctx)
+        if attachment is None or attachment.size > MAX_ATTACHMENT_BYTES:
+            await ctx.reply(EIGHT_FAILURE_TEXT, mention_author=False)
+            return
+
+        tmpdir = Path(tempfile.mkdtemp(prefix="audiobot_aeksets_"))
+        status = await ctx.reply(EIGHT_LOADING_TEXT, mention_author=False)
+        loop = asyncio.get_running_loop()
+
+        try:
+            suffix = Path(attachment.filename).suffix.lower()
+            source_path = tmpdir / f"input{suffix}"
+            await attachment.save(str(source_path))
+
+            output_name = unique_ogg_filename()
+            output_path = tmpdir / output_name
+
+            await loop.run_in_executor(
+                self.executor,
+                functools.partial(process_aeksets, source_path, output_path),
+            )
+
+            if output_path.stat().st_size > _upload_limit(ctx):
+                await _safe_edit(status, EIGHT_FAILURE_TEXT)
+                return
+
+            file = discord.File(str(output_path), filename=output_name)
+            await status.edit(content=EIGHT_SUCCESS_TEXT, attachments=[file])
+
+        except AudioProcessingError as exc:
+            log.warning("Audio processing failed: %s", exc)
+            await _safe_edit(status, EIGHT_FAILURE_TEXT)
+        except discord.HTTPException as exc:
+            log.warning("Upload failed: %s", exc)
+            await _safe_edit(status, EIGHT_FAILURE_TEXT)
+        except Exception:
+            log.exception("An error occurred in the aeksets command")
+            await _safe_edit(status, EIGHT_FAILURE_TEXT)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    @commands.hybrid_command(name="distro-kid-sets")
+    @commands.cooldown(1, 10, commands.BucketType.user)
+    async def distro_kid_sets(
+        self,
+        ctx: commands.Context,
+        attachment: discord.Attachment | None = None,
+    ) -> None:
+        """Apply the DistroKid Sets audio effect chain to an attached audio file."""
+        attachment = attachment or await resolve_audio_attachment(ctx)
+        if attachment is None or attachment.size > MAX_ATTACHMENT_BYTES:
+            await ctx.reply(
+                "Please attach one audio file under the bot's attachment size limit.",
+                mention_author=False,
+            )
+            return
+
+        tmpdir = Path(tempfile.mkdtemp(prefix="audiobot_distro_kid_sets_"))
+        status = await ctx.reply(EIGHT_LOADING_TEXT, mention_author=False)
+        loop = asyncio.get_running_loop()
+
+        try:
+            suffix = Path(attachment.filename).suffix.lower() or ".audio"
+            source_path = tmpdir / f"input{suffix}"
+            await attachment.save(str(source_path))
+
+            output_name = unique_ogg_filename()
+            output_path = tmpdir / output_name
+
+            # Approximate the supplied Audacity chain with FFmpeg filters:
+            # Bass/Treble (-24/-10 dB), +15 dB and +20 dB amplification,
+            # hard limiting at -3 dB, SC4-style compression, then +4 dB.
+            # The limiter prevents the large gain stages from simply clipping.
+            filter_chain = (
+                "bass=g=-24,"
+                "treble=g=-10,"
+                "volume=35dB,"
+                "alimiter=limit=0.707946:attack=5:release=20:level=0,"
+                "acompressor=threshold=0.307:ratio=19.511:"
+                "attack=281.764:release=183.571:makeup=5.35,"
+                "volume=4dB"
+            )
+
+            def render() -> None:
+                result = subprocess.run(
+                    [
+                        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                        "-i", str(source_path),
+                        "-map", "0:a:0",
+                        "-af", filter_chain,
+                        "-c:a", "libopus", "-b:a", "192k",
+                        str(output_path),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if (
+                    result.returncode != 0
+                    or not output_path.exists()
+                    or output_path.stat().st_size == 0
+                ):
+                    detail = result.stderr.strip()[-1200:]
+                    raise AudioProcessingError(
+                        f"DistroKid Sets render failed: {detail}"
+                    )
+
+            await loop.run_in_executor(self.executor, render)
+
+            if output_path.stat().st_size > _upload_limit(ctx):
+                await _safe_edit(status, EIGHT_FAILURE_TEXT)
+                return
+
+            file = discord.File(str(output_path), filename=output_name)
+            await status.edit(content=EIGHT_SUCCESS_TEXT, attachments=[file])
+
+        except AudioProcessingError as exc:
+            log.warning("DistroKid Sets processing failed: %s", exc)
+            await _safe_edit(status, EIGHT_FAILURE_TEXT)
+        except discord.HTTPException as exc:
+            log.warning("DistroKid Sets upload failed: %s", exc)
+            await _safe_edit(status, EIGHT_FAILURE_TEXT)
+        except Exception:
+            log.exception("An error occurred in DistroKid Sets command")
+            await _safe_edit(status, EIGHT_FAILURE_TEXT)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    @commands.hybrid_command(name="aekloudlowhz")
+    @commands.cooldown(1, 10, commands.BucketType.user)
+    async def aekloudlowhz(self, ctx: commands.Context, attachment: discord.Attachment | None = None) -> None:
+        attachment = attachment or await resolve_audio_attachment(ctx)
+        if attachment is None or attachment.size > MAX_ATTACHMENT_BYTES:
+            await ctx.reply(EIGHT_FAILURE_TEXT, mention_author=False)
+            return
+
+        tmpdir = Path(tempfile.mkdtemp(prefix="audiobot_aekloudlowhz_"))
+        status = await ctx.reply(EIGHT_LOADING_TEXT, mention_author=False)
+        loop = asyncio.get_running_loop()
+
+        try:
+            suffix = Path(attachment.filename).suffix.lower()
+            source_path = tmpdir / f"input{suffix}"
+            await attachment.save(str(source_path))
+
+            output_name = unique_ogg_filename()
+            output_path = tmpdir / output_name
+
+            await loop.run_in_executor(
+                self.executor,
+                functools.partial(process_aekloudlowhz, source_path, output_path),
+            )
+
+            if output_path.stat().st_size > _upload_limit(ctx):
+                await _safe_edit(status, EIGHT_FAILURE_TEXT)
+                return
+
+            file = discord.File(str(output_path), filename=output_name)
+            await status.edit(content=EIGHT_SUCCESS_TEXT, attachments=[file])
+
+        except AudioProcessingError as exc:
+            log.warning("Audio processing failed: %s", exc)
+            await _safe_edit(status, EIGHT_FAILURE_TEXT)
+        except discord.HTTPException as exc:
+            log.warning("Upload failed: %s", exc)
+            await _safe_edit(status, EIGHT_FAILURE_TEXT)
+        except Exception:
+            log.exception("An error occurred in the aekloudlowhz command")
+            await _safe_edit(status, EIGHT_FAILURE_TEXT)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    @commands.hybrid_command(name="speed")
+    @commands.cooldown(1, 10, commands.BucketType.user)
+    async def speed(
+        self,
+        ctx: commands.Context,
+        value: str | None = None,
+        attachment: discord.Attachment | None = None,
+    ) -> None:
+        await self._apply_effect(ctx, "speed", value, parse_speed, process_speed, attachment)
+
+    @commands.hybrid_command(name="pitch")
+    @commands.cooldown(1, 10, commands.BucketType.user)
+    async def pitch(
+        self,
+        ctx: commands.Context,
+        value: str | None = None,
+        attachment: discord.Attachment | None = None,
+    ) -> None:
+        await self._apply_effect(ctx, "pitch", value, parse_pitch, process_pitch, attachment)
+
+    @commands.hybrid_command(name="tempo")
+    @commands.cooldown(1, 10, commands.BucketType.user)
+    async def tempo(
+        self,
+        ctx: commands.Context,
+        value: str | None = None,
+        attachment: discord.Attachment | None = None,
+    ) -> None:
+        await self._apply_effect(ctx, "tempo", value, parse_tempo, process_tempo, attachment)
+
+    @commands.hybrid_command(name="cut")
+    @commands.cooldown(1, 10, commands.BucketType.user)
+    async def cut(
+        self,
+        ctx: commands.Context,
+        value: str | None = None,
+        attachment: discord.Attachment | None = None,
+    ) -> None:
+        await self._apply_effect(ctx, "cut", value, parse_time_value, process_cut, attachment)
+
+    @commands.hybrid_command(name="fcut")
+    @commands.cooldown(1, 10, commands.BucketType.user)
+    async def fcut(
+        self,
+        ctx: commands.Context,
+        value: str | None = None,
+        attachment: discord.Attachment | None = None,
+    ) -> None:
+        await self._apply_effect(ctx, "fcut", value, parse_time_value, process_fcut, attachment)
+
+    @commands.hybrid_command(name="probe")
+    @commands.cooldown(1, 10, commands.BucketType.user)
+    async def probe(self, ctx: commands.Context, attachment: discord.Attachment | None = None) -> None:
+        attachment = attachment or await resolve_audio_attachment(ctx)
+        if attachment is None or attachment.size > MAX_ATTACHMENT_BYTES:
+            await ctx.reply(EIGHT_FAILURE_TEXT, mention_author=False)
+            return
+
+        tmpdir = Path(tempfile.mkdtemp(prefix="audiobot_probe_"))
+        status = await ctx.reply(EIGHT_LOADING_TEXT, mention_author=False)
+        loop = asyncio.get_running_loop()
+
+        try:
+            suffix = Path(attachment.filename).suffix.lower()
+            source_path = tmpdir / f"input{suffix}"
+            await attachment.save(str(source_path))
+
+            waveform_name = "waveform.png"
+            waveform_path = tmpdir / waveform_name
+            result = await loop.run_in_executor(
+                self.executor,
+                functools.partial(process_probe, source_path, waveform_path),
+            )
+
+            if waveform_path.stat().st_size > _upload_limit(ctx):
+                await _safe_edit(status, EIGHT_FAILURE_TEXT)
+                return
+
+            embed = discord.Embed(color=discord.Color(0xFF69B4))
+            embed.set_author(
+                name=f"Checked Audio For {ctx.author.display_name}"[:256],
+                icon_url=(
+                    "https://cdn.discordapp.com/emojis/"
+                    "1564636387771158680.gif?size=44&animated=true"
+                ),
+            )
+            embed.add_field(
+                name="LUFS",
+                value=f"{result.integrated_lufs:.1f}",
+                inline=True,
+            )
+            embed.add_field(
+                name="Peak",
+                value=_format_dbfs(result.true_peak_dbfs),
+                inline=True,
+            )
+            embed.add_field(
+                name="Duration",
+                value=format_duration(result.duration_seconds),
+                inline=True,
+            )
+            embed.set_image(url=f"attachment://{waveform_name}")
+
+            waveform_file = discord.File(str(waveform_path), filename=waveform_name)
+            await status.edit(
+                content=None,
+                embed=embed,
+                attachments=[waveform_file],
+            )
+
+        except AudioProcessingError as exc:
+            log.warning("Audio analysis failed: %s", exc)
+            await _safe_edit(status, EIGHT_FAILURE_TEXT)
+        except discord.HTTPException as exc:
+            log.warning("Failed to send audio analysis results: %s", exc)
+            await _safe_edit(status, EIGHT_FAILURE_TEXT)
+        except Exception:
+            log.exception("An error occurred in the probe command")
+            await _safe_edit(status, EIGHT_FAILURE_TEXT)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    @commands.hybrid_command(name="mix")
+    @commands.cooldown(1, 10, commands.BucketType.user)
+    async def mix(
+        self,
+        ctx: commands.Context,
+        audio1: discord.Attachment | None = None,
+        audio2: discord.Attachment | None = None,
+    ) -> None:
+        if audio1 is not None and audio2 is not None:
+            attachments = [audio1, audio2]
+        else:
+            attachments = await resolve_audio_attachments(ctx, 2)
+        if len(attachments) < 2 or any(
+            attachment.size > MAX_ATTACHMENT_BYTES for attachment in attachments
+        ):
+            await ctx.reply(MIX_FAILURE_TEXT, mention_author=False)
+            return
+
+        view = MixOrderView(ctx, attachments, self.executor)
+        view.message = await ctx.reply(
+            MIX_PROMPT_TEXT,
+            view=view,
+            mention_author=False,
+        )
+
+    @commands.hybrid_command(name="ping")
+    async def ping(self, ctx: commands.Context) -> None:
+        await ctx.reply(f"Pong! {self.bot.latency * 1000:.0f} ms", mention_author=False)
+
+    @commands.hybrid_command(name="help")
+    async def help_command(self, ctx: commands.Context) -> None:
+        embed = discord.Embed(
+            color=discord.Color(0xFF69B4),
+        )
+        embed.set_author(
+            name=":  All commands for audio",
+            icon_url="https://cdn.discordapp.com/emojis/1564613366969016450.png",
+        )
+        embed.add_field(
+            name="/dl <link>",
+            value="Download audio from YouTube, TikTok, or SoundCloud.",
+            inline=False,
+        )
+        embed.add_field(
+            name="/8mono <highpass> <bass> <treble>",
+            value=(
+                "Apply the 8-track mono audio preset."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="/32tracks <highpass> <bass> <treble>",
+            value=(
+                "Apply the 32-track audio preset."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="/vol <value> <highpass> <bass> <treble>",
+            value="Adjust audio volume in dB (from -30 to +100).",
+            inline=False,
+        )
+        embed.add_field(
+            name="/stack <value> <highpass> <bass> <treble>",
+            value="Layer audio to increase loudness.",
+            inline=False,
+        )
+        embed.add_field(
+            name="/probe",
+            value="Analyze audio loudness.",
+            inline=False,
+        )
+        embed.add_field(
+            name="/op [volume_db] [bass_db] [speed]",
+            value="Upload your intro, song intro/tag, and main song. The bot automatically adds pre.ogg at the beginning and Epic Adventure.mp3 at the end. Optional: volume, bass, speed.",
+            inline=False,
+        )
+        embed.add_field(
+            name="/nbashiesty",
+            value="Apply speed 1.050x, tempo +5%, pitch -4.650 semitones, right-channel tremolo, and polarity inversion.",
+            inline=False,
+        )
+        embed.add_field(
+            name="/bypass",
+            value=(
+                "Apply the bypass audio preset."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="/distro-kid-sets",
+            value="Apply the DistroKid Sets bass, treble, amplification, limiting, and compression chain.",
+            inline=False,
+        )
+        embed.add_field(
+            name="/aeksets",
+            value=("Apply the AEK loudness preset."),
+            inline=False,
+        )
+        embed.add_field(
+            name="/aekloudlowhz",
+            value="Apply the AEK low-frequency loudness preset.",
+            inline=False,
+        )
+        embed.add_field(
+            name="/speed <value>",
+            value=(
+                "Change audio playback speed."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="/pitch <value>",
+            value=(
+                "Change audio pitch."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="/tempo <value>",
+            value=(
+                "Change tempo without changing pitch."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="/cut <value>",
+            value="Trim audio duration.",
+            inline=False,
+        )
+        embed.add_field(
+            name="/fcut <value>",
+            value="Remove time from the beginning of the audio.",
+            inline=False,
+        )
+        embed.add_field(
+            name="/mix",
+            value=(
+                "Combine an intro with a song."
+            ),
+            inline=False,
+        )
+
+        embed.set_footer(
+            text="@AEKz | Core i3 Gang | Special Edition",
+            icon_url="https://cdn.discordapp.com/emojis/1564617578435838052.png",
+        )
+        await ctx.reply(embed=embed, mention_author=False)
+
+    async def cog_command_error(
+        self,
+        ctx: commands.Context,
+        error: Exception,
+    ) -> None:
+        if isinstance(error, commands.CommandOnCooldown):
+            return
+
+        log.error("Command %s failed", ctx.command, exc_info=error)
+        try:
+            await ctx.reply(FAILURE_TEXT, mention_author=False)
+        except discord.HTTPException:
+            pass
